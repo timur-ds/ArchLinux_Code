@@ -1,7 +1,7 @@
 #!/bin/bash
 # ------------------------------------------------------------------------------
 # Скрипт: arch_maintenance.sh
-# Версия: 4.3.1
+# Версия: 4.3.2
 # ------------------------------------------------------------------------------
 # Назначение:
 #   Комплексное обслуживание Arch Linux с расширенным аудитом, обновлением и
@@ -120,13 +120,18 @@ system_upgrade() {
 # Установка недостающих компонентов и драйверов
 install_drivers_and_components() {
     echo -e "${BLUE}📦 Установка компонентов и драйверов...${NC}"
-    # Обратите внимание: пакет iwlwifi-firmware удалён, т.к. теперь linux-firmware включает его
-    pacman -S --noconfirm --needed \
-        intel-media-driver mesa vulkan-intel \
-        xf86-input-wacom xf86-input-libinput \
-        linux-firmware \
-        bluez bluez-utils alsa-utils pulseaudio \
-        zram-generator
+    # Если установлен pipewire-pulse, пропускаем установку pulseaudio, чтобы избежать конфликта
+    local -a packages=(
+        "intel-media-driver" "mesa" "vulkan-intel"
+        "xf86-input-wacom" "xf86-input-libinput"
+        "linux-firmware" "bluez" "bluez-utils" "alsa-utils" "zram-generator"
+    )
+    if pacman -Qi pipewire-pulse &>/dev/null; then
+        echo -e "${YELLOW}⚠ Обнаружен pipewire-pulse, пропускаем установку pulseaudio${NC}"
+    else
+        packages+=("pulseaudio")
+    fi
+    pacman -S --noconfirm --needed "${packages[@]}"
 }
 
 # Настройка TLP (управление энергопотреблением)
