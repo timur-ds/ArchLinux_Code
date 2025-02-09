@@ -28,139 +28,120 @@
 #   - Пакеты, которые скрипт будет устанавливать, перечислены в массиве NEEDED_PKGS.
 #
 # ------------------------------------------------------------------------------
-set -euo pipefail  # Строгий режим: выходим при ошибке или использовании неинициализированной переменной
+#!/bin/bash
+#
+# ------------------------------------------------------------------------------
+# Скрипт: arch_maintenance.sh
+# Версия: 2.1
+# ------------------------------------------------------------------------------
+set -euo pipefail
 
-# 1. Формируем путь к лог-файлу и перенаправляем вывод в него.
+# Проверка прав администратора
+if [[ $EUID -ne 0 ]]; then
+    echo "Перезапуск скрипта с правами root..."
+    exec sudo "$0" "$@"
+    exit 1
+fi
+
+# Логирование
 LOGFILE="$HOME/arch_maintenance_$(date +%Y-%m-%d_%H-%M-%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
 
-echo "=== [$(date)] Начало скрипта обслуживания Arch Linux (под обычным пользователем) ==="
+echo "=== [$(date)] Начало скрипта обслуживания Arch Linux ==="
 echo "Лог сохраняется в: $LOGFILE"
 
 # ------------------------------------------------------------------------------
-# 2. Список пакетов, которые вы хотите гарантированно иметь в системе
+# 1. Обязательные пакеты (включая git)
 # ------------------------------------------------------------------------------
 NEEDED_PKGS=(
-  "reflector"       # обновление списка зеркал
-  "pacman-contrib"  # paccache, checkupdates и т.п.
-  "clamav"          # антивирус (clamscan, freshclam)
-  "base-devel"      # инструменты сборки (make, gcc) — нужны для AUR
+    "git"            # для работы с AUR
+    "reflector"      # обновление зеркал
+    "pacman-contrib" # утилиты pacman
+    "clamav"         # антивирус
+    "base-devel"     # сборка пакетов
 )
 
 # ------------------------------------------------------------------------------
-# 3. Проверка / Установка недостающих пакетов (через sudo)
+# 2. Автоматическая установка недостающих пакетов
 # ------------------------------------------------------------------------------
-echo "=== Проверяем и при необходимости устанавливаем пакеты через sudo pacman -S ==="
-MISSING_PKGS=()
-for pkg in "${NEEDED_PKGS[@]}"; do
-  # pacman -Q pkg возвращает 0, если pkg установлен, иначе 1
-  if ! pacman -Q "$pkg" &>/dev/null; then
-    MISSING_PKGS+=("$pkg")
-  fi
-done
+install_missing() {
+    local missing=()
+    for pkg in "$@"; do
+        if ! pacman -Q "$pkg" &>/dev/null; then
+            missing+=("$pkg")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Устанавливаем: ${missing[*]}"
+        pacman -S --noconfirm "${missing[@]}"
+    fi
+}
 
-if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
-  echo "Не хватает пакетов: ${MISSING_PKGS[*]}"
-  sudo pacman -S --noconfirm "${MISSING_PKGS[@]}"
-else
-  echo "Все обязательные пакеты из списка уже установлены."
-fi
+echo "=== Проверка и установка зависимостей ==="
+install_missing "${NEEDED_PKGS[@]}"
 
 # ------------------------------------------------------------------------------
-# 4. Проверка наличия yay (AUR-хелпер). Если нет — собираем под текущим пользователем
+# 3. Установка/обновление yay (AUR-хелпер)
 # ------------------------------------------------------------------------------
 if ! command -v yay &>/dev/null; then
-  echo "=== yay не найден, собираем из AUR под обычным пользователем... ==="
-  tmp_dir=$(mktemp -d)
-  git clone https://aur.archlinux.org/yay.git "$tmp_dir/yay"
-  pushd "$tmp_dir/yay" >/dev/null
-  # Важно: сборка под обычным пользователем (makepkg от root не работает)
-  makepkg -si --noconfirm
-  popd >/dev/null
-  rm -rf "$tmp_dir"
-else
-  echo "yay уже установлен."
+    echo "=== Установка yay из AUR ==="
+    tmp_dir=$(mktemp -d)
+    git clone https://aur.archlinux.org/yay.git "$tmp_dir/yay"
+    pushd "$tmp_dir/yay" >/dev/null
+    makepkg -si --noconfirm
+    popd >/dev/null
+    rm -rf "$tmp_dir"
 fi
 
 # ------------------------------------------------------------------------------
-# 5. Обновление списка зеркал (reflector) через sudo
+# 4. Основные этапы обслуживания
 # ------------------------------------------------------------------------------
-if command -v reflector &>/dev/null; then
-  echo "=== Обновляем список зеркал (sudo reflector) ==="
-  sudo reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-fi
+echo "=== Обновление зеркал ==="
+reflector --latest 10 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
 
-# ------------------------------------------------------------------------------
-# 6. Обновление системы (официальные репозитории + AUR)
-# ------------------------------------------------------------------------------
-echo "=== Обновляем систему (sudo pacman -Syu) ==="
-sudo pacman -Syu --noconfirm
+echo "=== Обновление системы ==="
+pacman -Syu --noconfirm
 
+echo "=== Обновление AUR-пакетов ==="
 if command -v yay &>/dev/null; then
-  echo "=== Обновляем пакеты из AUR (yay) ==="
-  # yay запускается под текущим пользователем (уже не sudo).
-  yay -Syu --devel --timeupdate
+    yay -Syu --timeupdate --noconfirm
 fi
 
-# ------------------------------------------------------------------------------
-# 7. Очистка системы
-# ------------------------------------------------------------------------------
-echo "=== Удаляем осиротевшие пакеты (sudo pacman -Rns) ==="
-orphans=$(pacman -Qdtq || true)
-if [[ -n "$orphans" ]]; then
-  echo "Осиротевшие пакеты: $orphans"
-  sudo pacman -Rns --noconfirm $orphans
-else
-  echo "Осиротевших пакетов не найдено."
-fi
-
-echo "=== Очищаем кеш pacman (sudo paccache -rk2) ==="
-sudo paccache -rk2
-
-# Если yay установлен, вычистим кеш AUR
+echo "=== Очистка системы ==="
+paccache -rk2
 if command -v yay &>/dev/null; then
-  echo "=== Удаляем неиспользуемые AUR-зависимости (yay -Yc) ==="
-  yay -Yc --noconfirm
-  echo "=== Очищаем кэш AUR (yay -Sc) ==="
-  yay -Sc --noconfirm
+    yay -Yc --noconfirm
+    yay -Sc --noconfirm
 fi
+journalctl --vacuum-time=2weeks
 
-echo "=== Сокращаем системные логи старше 2 недель (sudo journalctl --vacuum-time=2weeks) ==="
-sudo journalctl --vacuum-time=2weeks
+echo "=== Проверка целостности пакетов ==="
+pacman -Qk || true
 
-# ------------------------------------------------------------------------------
-# 8. Проверка целостности пакетов (pacman -Qk)
-# ------------------------------------------------------------------------------
-echo "=== Проверка целостности пакетов (pacman -Qk) ==="
-pacman -Qk
-
-# ------------------------------------------------------------------------------
-# 9. Антивирусная проверка (ClamAV)
-# ------------------------------------------------------------------------------
+echo "=== Антивирусная проверка (домашняя директория) ==="
 if command -v clamscan &>/dev/null; then
-  echo "=== Обновляем базы ClamAV (sudo freshclam) и сканируем (clamscan) ==="
-  sudo freshclam
-  # Сканируем от обычного пользователя (root не обязателен),
-  # исключаем системные виртуальные директории:
-  clamscan -r --bell -i \
-    --exclude-dir="^/proc" \
-    --exclude-dir="^/sys" \
-    --exclude-dir="^/dev" \
-    /
+    freshclam
+    clamscan -r --bell -i "$HOME" \
+        --exclude-dir="^/proc" \
+        --exclude-dir="^/sys" \
+        --exclude-dir="^/dev"
+fi
+
+echo "=== Принудительная проверка ФС при перезагрузке ==="
+touch /forcefsck
+
+# ------------------------------------------------------------------------------
+# 5. Опциональная установка Stacer
+# ------------------------------------------------------------------------------
+read -p "Установить Stacer (графический инструмент для мониторинга системы)? (y/N): " install_stacer
+if [[ $install_stacer =~ [Yy] ]]; then
+    echo "=== Установка Stacer из AUR ==="
+    if command -v yay &>/dev/null; then
+        yay -S stacer --noconfirm
+    else
+        echo "Ошибка: yay не установлен. Установите yay для использования AUR."
+    fi
 fi
 
 # ------------------------------------------------------------------------------
-# 10. Принудительная проверка ФС (sudo touch /forcefsck)
-# ------------------------------------------------------------------------------
-echo "=== Создаём /forcefsck для проверки ФС при перезапуске (sudo touch) ==="
-sudo touch /forcefsck
-
-# ------------------------------------------------------------------------------
-# Завершение
-# ------------------------------------------------------------------------------
-echo "=== [$(date)] Обслуживание Arch Linux завершено. Лог: $LOGFILE ==="
-
-# Если пользователь имеет пакет libnotify, выводим уведомление
-if command -v notify-send &>/dev/null; then
-  notify-send "Arch Maintenance" "Скрипт завершён. Лог: $LOGFILE"
-fi
+echo "=== [$(date)] Обслуживание завершено ==="
