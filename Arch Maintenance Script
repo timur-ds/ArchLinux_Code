@@ -1,7 +1,7 @@
 #!/bin/bash
 # ------------------------------------------------------------------------------
 # Скрипт: arch_maintenance.sh
-# Версия: 4.3.2
+# Версия: 4.3.Final
 # ------------------------------------------------------------------------------
 # Назначение:
 #   Комплексное обслуживание Arch Linux с расширенным аудитом, обновлением и
@@ -11,17 +11,27 @@
 #     - Настройка энергосбережения (TLP) и исправление ошибок zram-generator
 #     - Перезапуск сервисов, балансировка Btrfs, обновление ключей и очистка кеша
 #     - Аппаратный и программный аудит с проверками безопасности
-#     - Дополнительный аудит: сетевая диагностика, статус системы, проверка
-#       обновлений прошивок и поиск осиротевших пакетов
-#     - Интерактивные уведомления и цветной вывод
+#     - Дополнительный аудит, включающий:
+#         • Проверку целостности системы
+#         • Поиск уязвимостей и обновлений ядра
+#         • Поиск подозрительных процессов, неиспользуемых сервисов и пакетов
+#         • Проверку небезопасных разрешений, переменных окружения, cron‑заданий
+#         • Аудит устаревших конфигураций, SSH, firewall, SELinux, AppArmor, PAM,
+#           GRUB, sysctl, systemd, journald, logrotate, syslog, auditd, fail2ban, ufw
+#         • Сбор подробной информации о железе: CPU, GPU, мониторы, RAM, диски,
+#           сетевая информация, материнская плата, BIOS/UEFI, USB-устройства, температура,
+#           батарея (для ноутбуков)
+#         • Интеграцию lynis‑аудита (если установлен)
+#     - Интерактивный режим (опционально)
+#     - Проверку дистрибутива
+#     - Периодическое обновление sudo‑токена для предотвращения повторных запросов
 #
 # Нововведения:
-#   1. Цветовое форматирование вывода
-#   2. Резервное копирование критичных файлов
-#   3. Расширенные проверки безопасности и дополнительный аудит (сеть,
-#      состояние системы, fwupd, осиротевшие пакеты)
-#   4. Гибкое управление Docker
-#   5. Интеграция полного обновления системы
+#   1. Расширенные проверки безопасности и аудита (более 20 функций)
+#   2. Сбор детальной информации о железе ПК
+#   3. Интерактивный режим обслуживания
+#   4. Проверка дистрибутива
+#   5. Обновление sudo‑токена в фоне
 #
 set -eo pipefail
 
@@ -43,19 +53,25 @@ declare -r YELLOW='\033[0;33m'
 declare -r BLUE='\033[0;34m'
 declare -r NC='\033[0m' # No Color
 
+# Функция обновления sudo-токена в фоне
+refresh_sudo() {
+    while true; do
+        sudo -n true
+        sleep 60
+        kill -0 "$$" || exit
+    done 2>/dev/null &
+}
+
 # Инициализация системы логирования
 init_logging() {
     mkdir -p "$LOGDIR" || {
         echo -e "${RED}❌ Ошибка создания каталога логов${NC}" >&2
         exit 1
     }
-    
     exec > >(tee -a "$LOGFILE") 2> >(tee -a "$LOGFILE" >&2)
-    
     # Ротация логов
     find "$LOGDIR" -name "*.log" -mtime +$MAX_LOG_DAYS -delete
     find "$LOGDIR" -name "*.txt" -mtime +$MAX_LOG_DAYS -delete
-    
     echo -e "${BLUE}=== Запуск скрипта: $(date) ===${NC}"
 }
 
@@ -68,13 +84,12 @@ check_privileges() {
     fi
 }
 
-# Установка пакетов с улучшенным обработчиком ошибок
+# Установка пакетов с обработкой ошибок
 install_packages() {
     local -a missing=()
     for pkg in "$@"; do
         pacman -Qi "$pkg" &>/dev/null || missing+=("$pkg")
     done
-
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "${BLUE}📦 Установка пакетов: ${missing[*]}${NC}"
         if ! pacman -S --noconfirm --needed "${missing[@]}"; then
@@ -88,13 +103,11 @@ install_packages() {
 backup_configs() {
     local -r backup_dir="${LOGDIR}/backups_${TIMESTAMP}"
     mkdir -p "$backup_dir"
-    
     declare -a critical_files=(
         "/etc/pacman.d/mirrorlist"
         "/etc/pacman.conf"
         "/etc/default/grub"
     )
-    
     echo -e "${BLUE}💾 Резервное копирование критичных файлов...${NC}"
     for file in "${critical_files[@]}"; do
         if [[ -f "$file" ]]; then
@@ -107,10 +120,8 @@ backup_configs() {
 system_upgrade() {
     echo -e "${BLUE}⚙️ Обновление зеркал...${NC}"
     reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-    
     echo -e "${BLUE}⚙️ Обновление системы (pacman -Syu)...${NC}"
     pacman -Syu --noconfirm
-    
     if command -v yay &>/dev/null; then
         echo -e "${BLUE}⚙️ Обновление AUR (yay)...${NC}"
         sudo -u "${SUDO_USER:-$USER}" yay -Syu --devel --timeupdate --noconfirm
@@ -120,7 +131,6 @@ system_upgrade() {
 # Установка недостающих компонентов и драйверов
 install_drivers_and_components() {
     echo -e "${BLUE}📦 Установка компонентов и драйверов...${NC}"
-    # Если установлен pipewire-pulse, пропускаем установку pulseaudio, чтобы избежать конфликта
     local -a packages=(
         "intel-media-driver" "mesa" "vulkan-intel"
         "xf86-input-wacom" "xf86-input-libinput"
@@ -134,7 +144,7 @@ install_drivers_and_components() {
     pacman -S --noconfirm --needed "${packages[@]}"
 }
 
-# Настройка TLP (управление энергопотреблением)
+# Настройка TLP (управление энергосбережением)
 configure_tlp() {
     echo -e "${BLUE}🔋 Настройка TLP...${NC}"
     systemctl enable tlp.service
@@ -156,7 +166,13 @@ restart_services() {
 # Балансировка и дефрагментация Btrfs
 btrfs_maintenance() {
     echo -e "${BLUE}🗜️ Балансировка и дефрагментация Btrfs...${NC}"
-    btrfs balance start / && btrfs filesystem defragment -r /
+    if btrfs balance start /; then
+        if ! btrfs filesystem defragment -r /; then
+            echo -e "${YELLOW}⚠ Некоторые файлы не удалось дефрагментировать (например, 'Text file busy'). Это нормально для занятых файлов, продолжаем обслуживание.${NC}"
+        fi
+    else
+        echo -e "${RED}❌ Ошибка при балансировке Btrfs. Пропускаем операцию дефрагментации.${NC}"
+    fi
 }
 
 # Обновление ключей системы
@@ -196,12 +212,10 @@ clean_system() {
     journalctl --vacuum-time=4weeks
     echo -e "${BLUE}🧹 Очистка кеша yay...${NC}"
     rm -rf /var/cache/yay/*
-    
     if command -v docker &>/dev/null; then
         echo -e "${BLUE}🐳 Анализ Docker...${NC}"
         local -ri running_containers
         running_containers=$(docker ps -q | wc -l)
-        
         if [[ $running_containers -gt 0 ]]; then
             echo -e "${YELLOW}⚠ Обнаружены запущенные контейнеры:${NC}"
             docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Status}}"
@@ -211,7 +225,6 @@ clean_system() {
                 exit 1
             fi
         fi
-        
         echo -e "${BLUE}🧹 Очистка Docker...${NC}"
         docker system prune -af --volumes
     fi
@@ -221,7 +234,6 @@ clean_system() {
 hardware_audit() {
     echo -e "${BLUE}🔍 Аппаратная диагностика...${NC}"
     sensors-detect --auto >/dev/null 2>&1
-    
     {
         echo -e "=== Аппаратный аудит ===\n"
         echo -e "● Информация о памяти:\n$(dmidecode -t memory)"
@@ -240,10 +252,8 @@ security_check() {
         echo -e "=== Отчет безопасности ===\n"
         echo -e "● Привилегированные пользователи:"
         awk -F: '$3 >= 1000 {print $1}' /etc/passwd
-        
         echo -e "\n● Критичные разрешения файлов:"
         find /etc -type f \( -perm -4000 -o -perm -2000 \) -exec ls -l {} \; 2>/dev/null
-        
         if command -v auditctl &>/dev/null; then
             echo -e "\n● Правила аудита:\n$(auditctl -l)"
         else
@@ -252,7 +262,7 @@ security_check() {
     } >> "$AUDIT_REPORT"
 }
 
-# Дополнительный аудит: сеть, состояние системы, обновления прошивок, осиротевшие пакеты
+# Дополнительный аудит: сеть, статус системы, fwupd, осиротевшие пакеты
 network_audit() {
     echo -e "${BLUE}🔍 Сетевая диагностика...${NC}"
     {
@@ -288,7 +298,7 @@ fw_update_check() {
             fwupdmgr get-updates
         } >> "$AUDIT_REPORT"
     else
-        echo -e "${YELLOW}⚠ fwupdmgr не установлен, пропускаем проверку прошивок${NC}"
+        echo -e "${YELLOW}⚠ fwupdmgr не установлен, пропускаем проверку прошивок${NC}" >> "$AUDIT_REPORT"
     fi
 }
 
@@ -300,11 +310,598 @@ orphan_packages() {
     } >> "$AUDIT_REPORT"
 }
 
-additional_audit() {
+# Новые функции аудита для информации о железе и конфигурациях
+
+# 1. Проверка устаревших конфигурационных файлов
+check_obsolete_configs() {
+    echo -e "${BLUE}🔍 Поиск устаревших конфигурационных файлов...${NC}"
+    {
+        echo -e "\n=== Устаревшие конфигурационные файлы ===\n"
+        pacman -Qdt || echo "Устаревшие конфигурационные файлы не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 2. Проверка на наличие небезопасных SSH-ключей
+check_unsafe_ssh_keys() {
+    echo -e "${BLUE}🔍 Поиск небезопасных SSH-ключей...${NC}"
+    {
+        echo -e "\n=== Небезопасные SSH-ключи ===\n"
+        find /etc/ssh -name "*.pub" -exec ssh-keygen -l -f {} \; | grep -E "(1024|2048)" || echo "Небезопасные SSH-ключи не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 3. Проверка на наличие небезопасных настроек SSH
+check_unsafe_ssh_config() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек SSH...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки SSH ===\n"
+        grep -Ei "(PermitRootLogin yes|Protocol 1)" /etc/ssh/sshd_config || echo "Небезопасные настройки SSH не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 4. Проверка на наличие небезопасных разрешений для каталогов
+check_unsafe_directory_permissions() {
+    echo -e "${BLUE}🔍 Поиск каталогов с небезопасными разрешениями...${NC}"
+    {
+        echo -e "\n=== Каталоги с небезопасными разрешениями ===\n"
+        find / -xdev -type d -perm -o+w -exec ls -ld {} \; 2>/dev/null || echo "Каталоги с небезопасными разрешениями не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 5. Проверка на наличие небезопасных настроек sudoers
+check_unsafe_sudoers() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек sudoers...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки sudoers ===\n"
+        grep -Ei "(NOPASSWD|!authenticate)" /etc/sudoers || echo "Небезопасные настройки sudoers не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 6. Проверка на наличие небезопасных настроек firewalld
+check_unsafe_firewalld() {
+    if command -v firewall-cmd &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек firewalld...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки firewalld ===\n"
+            firewall-cmd --list-all | grep -Ei "(open|allow)" || echo "Небезопасные настройки firewalld не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ firewalld не установлен, пропускаем проверку настроек firewalld${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 7. Проверка на наличие небезопасных настроек iptables
+check_unsafe_iptables() {
+    if command -v iptables &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек iptables...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки iptables ===\n"
+            iptables -L -n -v | grep -Ei "(ACCEPT|open)" || echo "Небезопасные настройки iptables не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ iptables не установлен, пропускаем проверку настроек iptables${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 8. Проверка на наличие небезопасных настроек SELinux
+check_unsafe_selinux() {
+    if command -v sestatus &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек SELinux...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки SELinux ===\n"
+            sestatus | grep -Ei "(disabled|permissive)" || echo "Небезопасные настройки SELinux не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ SELinux не установлен, пропускаем проверку настроек SELinux${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 9. Проверка на наличие небезопасных настроек AppArmor
+check_unsafe_apparmor() {
+    if command -v aa-status &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек AppArmor...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки AppArmor ===\n"
+            aa-status | grep -Ei "(disabled|inactive)" || echo "Небезопасные настройки AppArmor не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ AppArmor не установлен, пропускаем проверку настроек AppArmor${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 10. Проверка на наличие небезопасных настроек PAM
+check_unsafe_pam() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек PAM...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки PAM ===\n"
+        grep -Ei "(password.*pam_unix.so.*nullok|auth.*pam_tally2.so)" /etc/pam.d/* || echo "Небезопасные настройки PAM не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 11. Проверка на наличие небезопасных настроек GRUB
+check_unsafe_grub() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек GRUB...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки GRUB ===\n"
+        grep -Ei "(password|single)" /etc/default/grub || echo "Небезопасные настройки GRUB не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 12. Проверка на наличие небезопасных настроек sysctl
+check_unsafe_sysctl() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек sysctl...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки sysctl ===\n"
+        sysctl -a | grep -Ei "(net.ipv4.conf.all.rp_filter|net.ipv4.ip_forward)" || echo "Небезопасные настройки sysctl не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 13. Проверка на наличие небезопасных настроек systemd
+check_unsafe_systemd() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек systemd...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки systemd ===\n"
+        systemctl list-unit-files --state=enabled | grep -Ei "(root|unrestricted)" || echo "Небезопасные настройки systemd не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 14. Проверка на наличие небезопасных настроек journald
+check_unsafe_journald() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек journald...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки journald ===\n"
+        grep -Ei "(Storage|Compress)" /etc/systemd/journald.conf || echo "Небезопасные настройки journald не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 15. Проверка на наличие небезопасных настроек logrotate
+check_unsafe_logrotate() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек logrotate...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки logrotate ===\n"
+        grep -Ei "(compress|size)" /etc/logrotate.conf || echo "Небезопасные настройки logrotate не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 16. Проверка на наличие небезопасных настроек cron
+check_unsafe_cron() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек cron...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки cron ===\n"
+        grep -Ei "(PATH|MAILTO)" /etc/crontab || echo "Небезопасные настройки cron не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 17. Проверка на наличие небезопасных настроек syslog
+check_unsafe_syslog() {
+    echo -e "${BLUE}🔍 Поиск небезопасных настроек syslog...${NC}"
+    {
+        echo -e "\n=== Небезопасные настройки syslog ===\n"
+        grep -Ei "(Compress|Size)" /etc/rsyslog.conf || echo "Небезопасные настройки syslog не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+# 18. Проверка на наличие небезопасных настроек auditd
+check_unsafe_auditd() {
+    if command -v auditctl &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек auditd...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки auditd ===\n"
+            auditctl -l | grep -Ei "(size|backlog)" || echo "Небезопасные настройки auditd не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ auditd не установлен, пропускаем проверку настроек auditd${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 19. Проверка на наличие небезопасных настроек fail2ban
+check_unsafe_fail2ban() {
+    if command -v fail2ban-client &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек fail2ban...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки fail2ban ===\n"
+            fail2ban-client status | grep -Ei "(jail|ban)" || echo "Небезопасные настройки fail2ban не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ fail2ban не установлен, пропускаем проверку настроек fail2ban${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# 20. Проверка на наличие небезопасных настроек ufw
+check_unsafe_ufw() {
+    if command -v ufw &>/dev/null; then
+        echo -e "${BLUE}🔍 Поиск небезопасных настроек ufw...${NC}"
+        {
+            echo -e "\n=== Небезопасные настройки ufw ===\n"
+            ufw status verbose | grep -Ei "(allow|deny)" || echo "Небезопасные настройки ufw не обнаружены"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ ufw не установлен, пропускаем проверку настроек ufw${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# Новые функции для сбора информации о железе:
+
+# 21. Сбор информации о процессоре
+check_cpu_info() {
+    echo -e "${BLUE}🔍 Сбор информации о процессоре...${NC}"
+    {
+        echo -e "\n=== Информация о процессоре ===\n"
+        lscpu
+    } >> "$AUDIT_REPORT"
+}
+
+# 22. Сбор информации о GPU
+check_gpu_info() {
+    echo -e "${BLUE}🔍 Сбор информации о GPU...${NC}"
+    {
+        echo -e "\n=== Информация о GPU ===\n"
+        echo "● Интегрированные GPU:"
+        lspci | grep -i vga
+        echo -e "\n● Дискретные GPU:"
+        lspci | grep -i 3d
+        if command -v nvidia-smi &>/dev/null; then
+            echo -e "\n● Информация о NVIDIA GPU:"
+            nvidia-smi
+        else
+            echo -e "\n● NVIDIA GPU не обнаружены или драйверы не установлены."
+        fi
+    } >> "$AUDIT_REPORT"
+}
+
+# 23. Сбор информации о мониторах
+check_monitor_info() {
+    echo -e "${BLUE}🔍 Сбор информации о мониторах...${NC}"
+    {
+        echo -e "\n=== Информация о мониторах ===\n"
+        if command -v xrandr &>/dev/null; then
+            echo "● Подключенные мониторы (xrandr):"
+            xrandr --listmonitors
+        else
+            echo "● xrandr не установлен, пропускаем сбор информации о мониторах."
+        fi
+        if command -v edid-decode &>/dev/null; then
+            echo -e "\n● EDID-данные мониторов:"
+            for edid in /sys/class/drm/*/edid; do
+                if [[ -f "$edid" ]]; then
+                    echo "▲ Устройство: $(basename "$(dirname "$edid")")"
+                    edid-decode "$edid"
+                fi
+            done
+        else
+            echo -e "\n● edid-decode не установлен, пропускаем анализ EDID."
+        fi
+    } >> "$AUDIT_REPORT"
+}
+
+# 24. Сбор информации о памяти (RAM)
+check_memory_info() {
+    echo -e "${BLUE}🔍 Сбор информации о памяти (RAM)...${NC}"
+    {
+        echo -e "\n=== Информация о памяти (RAM) ===\n"
+        echo "● Общая информация (free):"
+        free -h
+        echo -e "\n● Детальная информация (dmidecode):"
+        dmidecode -t memory | grep -E "(Size:|Type:|Speed:)"
+    } >> "$AUDIT_REPORT"
+}
+
+# 25. Сбор информации о дисках
+check_disk_info() {
+    echo -e "${BLUE}🔍 Сбор информации о дисках...${NC}"
+    {
+        echo -e "\n=== Информация о дисках ===\n"
+        echo "● Список дисков (lsblk):"
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE
+        echo -e "\n● Информация о разделах (fdisk):"
+        fdisk -l
+        echo -e "\n● Информация о производительности (hdparm):"
+        for disk in $(lsblk -d -o NAME -n); do
+            echo "▲ Устройство: /dev/$disk"
+            hdparm -I /dev/$disk | grep -E "(Model|Speed|Rotation Rate)"
+        done
+    } >> "$AUDIT_REPORT"
+}
+
+# 26. Сбор информации о сетевых интерфейсах
+check_network_info() {
+    echo -e "${BLUE}🔍 Сбор информации о сетевых интерфейсах...${NC}"
+    {
+        echo -e "\n=== Информация о сетевых интерфейсах ===\n"
+        echo "● Список интерфейсов (ip):"
+        ip a
+        echo -e "\n● Информация о скорости и дуплексе (ethtool):"
+        for iface in $(ip -o link show | awk -F': ' '{print $2}'); do
+            echo "▲ Интерфейс: $iface"
+            ethtool "$iface" | grep -E "(Speed|Duplex)" || echo "Нет данных для $iface"
+        done
+    } >> "$AUDIT_REPORT"
+}
+
+# 27. Сбор информации о материнской плате
+check_motherboard_info() {
+    echo -e "${BLUE}🔍 Сбор информации о материнской плате...${NC}"
+    {
+        echo -e "\n=== Информация о материнской плате ===\n"
+        dmidecode -t baseboard
+    } >> "$AUDIT_REPORT"
+}
+
+# 28. Сбор информации о BIOS/UEFI
+check_bios_info() {
+    echo -e "${BLUE}🔍 Сбор информации о BIOS/UEFI...${NC}"
+    {
+        echo -e "\n=== Информация о BIOS/UEFI ===\n"
+        dmidecode -t bios
+    } >> "$AUDIT_REPORT"
+}
+
+# 29. Сбор информации о USB-устройствах
+check_usb_info() {
+    echo -e "${BLUE}🔍 Сбор информации о USB-устройствах...${NC}"
+    {
+        echo -e "\n=== Информация о USB-устройствах ===\n"
+        lsusb
+    } >> "$AUDIT_REPORT"
+}
+
+# 30. Сбор информации о температуре и вентиляторах
+check_temperature_info() {
+    echo -e "${BLUE}🔍 Сбор информации о температуре и вентиляторах...${NC}"
+    {
+        echo -e "\n=== Информация о температуре и вентиляторах ===\n"
+        sensors
+    } >> "$AUDIT_REPORT"
+}
+
+# 31. Сбор информации о батарее (для ноутбуков)
+check_battery_info() {
+    echo -e "${BLUE}🔍 Сбор информации о батарее...${NC}"
+    {
+        echo -e "\n=== Информация о батарее ===\n"
+        if command -v upower &>/dev/null; then
+            upower -i $(upower -e | grep battery)
+        else
+            echo "● upower не установлен, пропускаем сбор информации о батарее."
+        fi
+    } >> "$AUDIT_REPORT"
+}
+
+# Функция расширенного аудита, объединяющая все проверки
+extended_audit() {
+    check_system_integrity
+    check_kernel_vulnerabilities
+    check_kernel_updates
+    check_suspicious_processes
+    check_unused_services
+    check_unsafe_permissions
+    check_obsolete_packages
+    check_unused_packages
+    check_unsafe_env_vars
+    check_unsafe_cron_jobs
+    run_lynis_audit
     network_audit
     system_status
     fw_update_check
     orphan_packages
+
+    # Старые проверки
+    check_obsolete_configs
+    check_unsafe_ssh_keys
+    check_unsafe_ssh_config
+    check_unsafe_directory_permissions
+    check_unsafe_sudoers
+    check_unsafe_firewalld
+    check_unsafe_iptables
+    check_unsafe_selinux
+    check_unsafe_apparmor
+    check_unsafe_pam
+    check_unsafe_grub
+    check_unsafe_sysctl
+    check_unsafe_systemd
+    check_unsafe_journald
+    check_unsafe_logrotate
+    check_unsafe_cron
+    check_unsafe_syslog
+    check_unsafe_auditd
+    check_unsafe_fail2ban
+    check_unsafe_ufw
+
+    # Новые функции для сбора информации о железе
+    check_cpu_info
+    check_gpu_info
+    check_monitor_info
+    check_memory_info
+    check_disk_info
+    check_network_info
+    check_motherboard_info
+    check_bios_info
+    check_usb_info
+    check_temperature_info
+    check_battery_info
+}
+
+# Дополнительные функции аудита из предыдущей версии:
+check_system_integrity() {
+    echo -e "${BLUE}🔍 Проверка целостности системы...${NC}"
+    {
+        echo -e "\n=== Проверка целостности системы ===\n"
+        pacman -Qkk | grep -v " 0 errors" || echo "Нет ошибок целостности"
+    } >> "$AUDIT_REPORT"
+}
+
+check_kernel_vulnerabilities() {
+    if command -v lynis &>/dev/null; then
+        echo -e "${BLUE}🔍 Проверка уязвимостей ядра (lynis)...${NC}"
+        {
+            echo -e "\n=== Проверка уязвимостей ядра ===\n"
+            lynis audit system --quick --no-colors | grep -i "kernel"
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ lynis не установлен, пропускаем проверку уязвимостей ядра${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+check_kernel_updates() {
+    echo -e "${BLUE}🔍 Проверка обновлений ядра...${NC}"
+    {
+        echo -e "\n=== Проверка обновлений ядра ===\n"
+        pacman -Qs linux | grep "linux " 
+        echo -e "\n● Доступные обновления ядра:"
+        pacman -Sy --print-format "%n %v" linux | grep "linux "
+    } >> "$AUDIT_REPORT"
+}
+
+check_suspicious_processes() {
+    echo -e "${BLUE}🔍 Поиск подозрительных процессов...${NC}"
+    {
+        echo -e "\n=== Подозрительные процессы ===\n"
+        ps aux | grep -Ei "(cryptominer|malware|backdoor|exploit)" || echo "Подозрительные процессы не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+check_unused_services() {
+    echo -e "${BLUE}🔍 Поиск неиспользуемых сервисов...${NC}"
+    {
+        echo -e "\n=== Неиспользуемые сервисы ===\n"
+        systemctl list-unit-files --state=enabled | grep -Ev "(static|indirect)" || echo "Неиспользуемые сервисы не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+check_obsolete_packages() {
+    echo -e "${BLUE}🔍 Поиск устаревших пакетов...${NC}"
+    {
+        echo -e "\n=== Устаревшие пакеты ===\n"
+        pacman -Qm || echo "Устаревшие пакеты не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+check_unused_packages() {
+    echo -e "${BLUE}🔍 Поиск неиспользуемых пакетов...${NC}"
+    {
+        echo -e "\n=== Неиспользуемые пакеты ===\n"
+        pacman -Qtdq || echo "Неиспользуемые пакеты не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+check_unsafe_env_vars() {
+    echo -e "${BLUE}🔍 Поиск небезопасных переменных окружения...${NC}"
+    {
+        echo -e "\n=== Небезопасные переменные окружения ===\n"
+        env | grep -Ei "(LD_PRELOAD|LD_LIBRARY_PATH)" || echo "Небезопасные переменные окружения не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+check_unsafe_cron_jobs() {
+    echo -e "${BLUE}🔍 Поиск небезопасных cron-заданий...${NC}"
+    {
+        echo -e "\n=== Небезопасные cron-задания ===\n"
+        find /etc/cron* -type f -exec grep -Hv "^#" {} \; | grep -Ei "(wget|curl|sh -c)" || echo "Небезопасные cron-задания не обнаружены"
+    } >> "$AUDIT_REPORT"
+}
+
+run_lynis_audit() {
+    if command -v lynis &>/dev/null; then
+        echo -e "${BLUE}🔍 Запуск комплексного аудита (lynis)...${NC}"
+        {
+            echo -e "\n=== Комплексный аудит (lynis) ===\n"
+            lynis audit system --quick --no-colors
+        } >> "$AUDIT_REPORT"
+    else
+        echo -e "${YELLOW}⚠ lynis не установлен, пропускаем комплексный аудит${NC}" >> "$AUDIT_REPORT"
+    fi
+}
+
+# Интерактивный режим обслуживания
+interactive_mode() {
+    echo -e "${BLUE}🔍 Интерактивный режим обслуживания:${NC}"
+    select action in "Обновление системы" "Очистка системы" "Аудит безопасности" "Расширенный аудит" "Выход"; do
+        case $action in
+            "Обновление системы")
+                system_upgrade
+                extra_update_maintenance
+                ;;
+            "Очистка системы")
+                clean_system
+                ;;
+            "Аудит безопасности")
+                security_check
+                ;;
+            "Расширенный аудит")
+                extended_audit
+                ;;
+            "Выход")
+                break
+                ;;
+            *)
+                echo -e "${RED}❌ Неверный выбор${NC}" ;;
+        esac
+    done
+}
+
+# Проверка дистрибутива
+check_distro() {
+    if [[ -f /etc/arch-release ]]; then
+        echo "Arch Linux"
+    elif [[ -f /etc/debian_version ]]; then
+        echo "Debian/Ubuntu"
+    else
+        echo "Unknown"
+    fi
+}
+
+# Функция, объединяющая расширенный аудит
+extended_audit() {
+    check_system_integrity
+    check_kernel_vulnerabilities
+    check_kernel_updates
+    check_suspicious_processes
+    check_unused_services
+    check_unsafe_permissions
+    check_obsolete_packages
+    check_unused_packages
+    check_unsafe_env_vars
+    check_unsafe_cron_jobs
+    run_lynis_audit
+    network_audit
+    system_status
+    fw_update_check
+    orphan_packages
+
+    # Старые проверки
+    check_obsolete_configs
+    check_unsafe_ssh_keys
+    check_unsafe_ssh_config
+    check_unsafe_directory_permissions
+    check_unsafe_sudoers
+    check_unsafe_firewalld
+    check_unsafe_iptables
+    check_unsafe_selinux
+    check_unsafe_apparmor
+    check_unsafe_pam
+    check_unsafe_grub
+    check_unsafe_sysctl
+    check_unsafe_systemd
+    check_unsafe_journald
+    check_unsafe_logrotate
+    check_unsafe_cron
+    check_unsafe_syslog
+    check_unsafe_auditd
+    check_unsafe_fail2ban
+    check_unsafe_ufw
+
+    # Новые функции для сбора информации о железе
+    check_cpu_info
+    check_gpu_info
+    check_monitor_info
+    check_memory_info
+    check_disk_info
+    check_network_info
+    check_motherboard_info
+    check_bios_info
+    check_usb_info
+    check_temperature_info
+    check_battery_info
 }
 
 # Генерация финального отчета
@@ -314,7 +911,6 @@ generate_report() {
         echo -e "=== Рекомендации ===\n"
         echo -e "● Важные события:"
         grep -Pi 'error|warning|fail' "$LOGFILE" | sort | uniq -c | sed 's/^/  /'
-        
         echo -e "\n● Использование дисков:"
         df -hT --exclude-type=tmpfs --exclude-type=devtmpfs | awk '
             NR==1 {print}
@@ -328,17 +924,26 @@ generate_report() {
 main() {
     init_logging
     check_privileges "$@"
-    
+    refresh_sudo  # Обновление sudo-токена в фоне
     echo -e "${BLUE}🛠️ Инициализация обслуживания...${NC}"
-    install_packages "${DIAG_PKGS[@]}"
-    backup_configs
-    system_upgrade
-    extra_update_maintenance
-    clean_system
-    hardware_audit
-    security_check
-    additional_audit
-    generate_report
+    
+    if [[ "$1" == "--interactive" ]]; then
+        interactive_mode
+    else
+        install_packages "${DIAG_PKGS[@]}"
+        backup_configs
+        system_upgrade
+        extra_update_maintenance
+        clean_system
+        hardware_audit
+        security_check
+        network_audit
+        system_status
+        fw_update_check
+        orphan_packages
+        extended_audit
+        generate_report
+    fi
 }
 
 # Точка входа
