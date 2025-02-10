@@ -1,7 +1,7 @@
 #!/bin/bash
 # ------------------------------------------------------------------------------
 # Скрипт: arch_maintenance.sh
-# Версия: 4.3.Final
+# Версия: 4.3
 # ------------------------------------------------------------------------------
 # Назначение:
 #   Комплексное обслуживание Arch Linux с расширенным аудитом, обновлением и
@@ -25,6 +25,7 @@
 #     - Интерактивный режим (опционально)
 #     - Проверку дистрибутива
 #     - Периодическое обновление sudo‑токена для предотвращения повторных запросов
+#     - Сохранение итогового отчёта (лог + аудит) в один TXT-файл с датой и временем
 #
 # Нововведения:
 #   1. Расширенные проверки безопасности и аудита (более 20 функций)
@@ -32,6 +33,7 @@
 #   3. Интерактивный режим обслуживания
 #   4. Проверка дистрибутива
 #   5. Обновление sudo‑токена в фоне
+#   6. Сохранение полного отчёта в один TXT-файл с датой и временем
 #
 set -eo pipefail
 
@@ -181,10 +183,10 @@ refresh_keys() {
     pacman-key --refresh-keys
 }
 
-# Очистка кеша pacman
+# Очистка кеша pacman (автоматический ответ на запросы)
 clean_cache() {
     echo -e "${BLUE}🧹 Очистка кеша pacman (pacman -Sc)...${NC}"
-    pacman -Sc --noconfirm
+    yes | pacman -Sc --noconfirm
 }
 
 # Вывод сообщения о необходимости перезагрузки
@@ -807,7 +809,7 @@ run_lynis_audit() {
             echo -e "\n=== Комплексный аудит (lynis) ===\n"
             lynis audit system --quick --no-colors
         } >> "$AUDIT_REPORT"
-    else
+    } else
         echo -e "${YELLOW}⚠ lynis не установлен, пропускаем комплексный аудит${NC}" >> "$AUDIT_REPORT"
     fi
 }
@@ -850,100 +852,17 @@ check_distro() {
     fi
 }
 
-# Функция, объединяющая расширенный аудит
-extended_audit() {
-    check_system_integrity
-    check_kernel_vulnerabilities
-    check_kernel_updates
-    check_suspicious_processes
-    check_unused_services
-    check_unsafe_permissions
-    check_obsolete_packages
-    check_unused_packages
-    check_unsafe_env_vars
-    check_unsafe_cron_jobs
-    run_lynis_audit
-    network_audit
-    system_status
-    fw_update_check
-    orphan_packages
-
-    # Старые проверки
-    check_obsolete_configs
-    check_unsafe_ssh_keys
-    check_unsafe_ssh_config
-    check_unsafe_directory_permissions
-    check_unsafe_sudoers
-    check_unsafe_firewalld
-    check_unsafe_iptables
-    check_unsafe_selinux
-    check_unsafe_apparmor
-    check_unsafe_pam
-    check_unsafe_grub
-    check_unsafe_sysctl
-    check_unsafe_systemd
-    check_unsafe_journald
-    check_unsafe_logrotate
-    check_unsafe_cron
-    check_unsafe_syslog
-    check_unsafe_auditd
-    check_unsafe_fail2ban
-    check_unsafe_ufw
-
-    # Новые функции для сбора информации о железе
-    check_cpu_info
-    check_gpu_info
-    check_monitor_info
-    check_memory_info
-    check_disk_info
-    check_network_info
-    check_motherboard_info
-    check_bios_info
-    check_usb_info
-    check_temperature_info
-    check_battery_info
-}
-
-# Генерация финального отчета
-generate_report() {
-    echo -e "${BLUE}📄 Формирование отчета...${NC}"
+# Функция сохранения полного отчета (лог + аудит) в один TXT-файл с датой и временем
+save_full_report() {
+    local final_report="${LOGDIR}/full_report_${TIMESTAMP}.txt"
     {
-        echo -e "=== Рекомендации ===\n"
-        echo -e "● Важные события:"
-        grep -Pi 'error|warning|fail' "$LOGFILE" | sort | uniq -c | sed 's/^/  /'
-        echo -e "\n● Использование дисков:"
-        df -hT --exclude-type=tmpfs --exclude-type=devtmpfs | awk '
-            NR==1 {print}
-            $6 >= 80 {printf "\033[33m%s\033[0m\n", $0; next}
-            {print}
-        '
-    } >> "$AUDIT_REPORT"
-}
-
-# Главная функция
-main() {
-    init_logging
-    check_privileges "$@"
-    refresh_sudo  # Обновление sudo-токена в фоне
-    echo -e "${BLUE}🛠️ Инициализация обслуживания...${NC}"
-    
-    if [[ "$1" == "--interactive" ]]; then
-        interactive_mode
-    else
-        install_packages "${DIAG_PKGS[@]}"
-        backup_configs
-        system_upgrade
-        extra_update_maintenance
-        clean_system
-        hardware_audit
-        security_check
-        network_audit
-        system_status
-        fw_update_check
-        orphan_packages
-        extended_audit
-        generate_report
-    fi
+        echo "=== FULL REPORT: $(date) ==="
+        echo -e "\n=== Maintenance Log ===\n"
+        cat "$LOGFILE"
+        echo -e "\n=== Audit Report ===\n"
+        cat "$AUDIT_REPORT"
+    } > "$final_report"
+    echo -e "${GREEN}Полный отчет сохранен в: ${final_report}${NC}"
 }
 
 # Точка входа
@@ -952,5 +871,6 @@ main "$@"
 echo -e "\n${GREEN}✅ Обслуживание успешно завершено: $(date)${NC}"
 echo -e "● Логи: ${BLUE}${LOGFILE}${NC}"
 echo -e "● Отчет: ${BLUE}${AUDIT_REPORT}${NC}"
+echo -e "● Полный отчет сохранен в: ${BLUE}${LOGDIR}/full_report_${TIMESTAMP}.txt${NC}"
 echo -e "● Критичные предупреждения:"
 grep --color=auto -iP 'error|warning|fail' "$LOGFILE" | sort | uniq
